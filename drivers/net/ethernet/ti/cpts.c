@@ -46,6 +46,11 @@ static int event_type(struct cpts_event *event)
 	return (event->high >> EVENT_TYPE_SHIFT) & EVENT_TYPE_MASK;
 }
 
+static int event_port(struct cpts_event *event)
+{
+	return (event->high >> PORT_NUMBER_SHIFT) & PORT_NUMBER_MASK;
+}
+
 static int cpts_fifo_pop(struct cpts *cpts, u32 *high, u32 *low)
 {
 	u32 r = cpts_read32(cpts, intstat_raw);
@@ -67,7 +72,7 @@ static int cpts_fifo_read(struct cpts *cpts, int match)
 	int i, type = -1;
 	u32 hi, lo;
 	struct cpts_event *event;
-
+	struct ptp_clock_event pevent;
 	for (i = 0; i < CPTS_FIFO_DEPTH; i++) {
 		if (cpts_fifo_pop(cpts, &hi, &lo))
 			break;
@@ -81,6 +86,12 @@ static int cpts_fifo_read(struct cpts *cpts, int match)
 		event->low = lo;
 		type = event_type(event);
 		switch (type) {
+		case CPTS_EV_HW:
+			pevent.timestamp = timecounter_cyc2time(&cpts->tc, event->low);
+			pevent.type = PTP_CLOCK_EXTTS;
+			pevent.index = event_port(event) - 1;
+			ptp_clock_event(cpts->clock, &pevent);
+			break;
 		case CPTS_EV_PUSH:
 		case CPTS_EV_RX:
 		case CPTS_EV_TX:
@@ -89,7 +100,6 @@ static int cpts_fifo_read(struct cpts *cpts, int match)
 			break;
 		case CPTS_EV_ROLL:
 		case CPTS_EV_HALF:
-		case CPTS_EV_HW:
 			break;
 		default:
 			pr_err("cpts: unknown event type\n");
@@ -198,35 +208,115 @@ static int cpts_ptp_settime(struct ptp_clock_info *ptp,
 	return 0;
 }
 
+static int cpts_ptp_verify(struct ptp_clock_info *ptp, unsigned int pin,
+                           enum ptp_pin_function func, unsigned int chan)
+{
+	/* Check number of pins */
+	if (pin >= ptp->n_pins || !ptp->pin_config)
+		return -EINVAL;
+
+	/* Lock the channel */
+	if (chan != ptp->pin_config[pin].chan)
+		return -EINVAL;
+
+	/* Check function */
+	switch (func) {
+		case PTP_PF_NONE:
+		case PTP_PF_EXTTS:
+        	break;
+    	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int cpts_ptp_enable(struct ptp_clock_info *ptp,
 			   struct ptp_clock_request *rq, int on)
 {
+	int pin;
+	u32 ctrl, mask;
+	struct cpts *cpts = container_of(ptp, struct cpts, info);
+	switch(rq->type) {
+	case PTP_CLK_REQ_EXTTS:
+		pin = rq->extts.index;
+		switch (pin) {
+		case 0: mask = HW1_TS_PUSH_EN; break;
+		case 1: mask = HW2_TS_PUSH_EN; break;
+		case 2: mask = HW3_TS_PUSH_EN; break;
+		case 3: mask = HW4_TS_PUSH_EN; break;
+		default:
+			return -EINVAL;
+		}
+		ctrl = cpts_read32(cpts, control);
+		if (on)
+			ctrl |= mask;
+		else
+			ctrl &= ~mask;
+		cpts_write32(cpts, ctrl, control);
+		return 0;
+	default:
+		break;
+	}
 	return -EOPNOTSUPP;
 }
 
+static struct ptp_pin_desc cpts_pins[4] = {
+	{
+		.name = "HW1_TS_PUSH",
+		.index = 0,
+		.func = PTP_PF_NONE,
+		.chan = 0
+	},
+	{
+		.name = "HW2_TS_PUSH",
+		.index = 1,
+		.func = PTP_PF_NONE,
+		.chan = 1
+	},
+	{
+		.name = "HW3_TS_PUSH",
+		.index = 2,
+		.func = PTP_PF_NONE,
+		.chan = 2
+	},
+	{
+		.name = "HW4_TS_PUSH",
+		.index = 3,
+		.func = PTP_PF_NONE,
+		.chan = 3
+	}
+};
+
 static struct ptp_clock_info cpts_info = {
 	.owner		= THIS_MODULE,
-	.name		= "CTPS timer",
+	.name		= "CPTS timer",
 	.max_adj	= 1000000,
-	.n_ext_ts	= 0,
-	.n_pins		= 0,
+	.n_alarm    	= 0,
+	.n_ext_ts	= 4,
+	.n_pins		= 4,
 	.pps		= 0,
+	.pin_config 	= cpts_pins,
 	.adjfreq	= cpts_ptp_adjfreq,
 	.adjtime	= cpts_ptp_adjtime,
 	.gettime64	= cpts_ptp_gettime,
 	.settime64	= cpts_ptp_settime,
 	.enable		= cpts_ptp_enable,
+	.verify     	= cpts_ptp_verify,
 };
 
 static void cpts_overflow_check(struct work_struct *work)
 {
+	u32 ctrl;
 	struct timespec64 ts;
 	struct cpts *cpts = container_of(work, struct cpts, overflow_work.work);
 
-	cpts_write32(cpts, CPTS_EN, control);
+	ctrl = cpts_read32(cpts, control);
+	ctrl |= CPTS_EN;
+	cpts_write32(cpts, ctrl, control);
 	cpts_write32(cpts, TS_PEND_EN, int_enable);
 	cpts_ptp_gettime(&cpts->info, &ts);
-	pr_debug("cpts overflow check at %lld.%09lu\n", ts.tv_sec, ts.tv_nsec);
+	pr_info("cpts overflow check at %lld.%09lu\n", ts.tv_sec, ts.tv_nsec);
 	schedule_delayed_work(&cpts->overflow_work, CPTS_OVERFLOW_PERIOD);
 }
 
